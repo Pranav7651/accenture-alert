@@ -31,7 +31,7 @@ from datetime import datetime
 CONFIG = {
     # Telegram Bot Token — get from @BotFather on Telegram
     # Example: "7123456789:AAFxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-    "telegram_bot_token": "8532589827:AAGGX7ffzD3L5ZD2EmOx1Yje-ncArgQEvQE",
+   "telegram_bot_token": "8532589827:AAGGX7ffzD3L5ZD2EmOx1Yje-ncArgQEvQE",
 
     # Your Telegram Chat ID — get from @userinfobot on Telegram
     # Example: "987654321"
@@ -39,7 +39,7 @@ CONFIG = {
 
     # ── Job Filters ──────────────────────────
     # Keywords to search (leave empty "" to get ALL India jobs)
-    "search_keyword": "Web Developer",
+    "search_keyword": "software engineer",
 
     # Location filter
     "location": "India",
@@ -52,6 +52,15 @@ CONFIG = {
 
     # File to store seen job IDs between runs
     "state_file": "seen_jobs.json",
+
+    # ── Experience Filter ────────────────────
+    # Your current experience in years
+    "my_experience_years": 1,
+
+    # Only notify for jobs whose title suggests this experience range
+    # The script checks job titles for level keywords (see EXPERIENCE_RULES below)
+    # Set to True to enable filtering, False to get ALL jobs regardless of level
+    "filter_by_experience": True,
 }
 
 # ─────────────────────────────────────────────
@@ -69,6 +78,79 @@ HEADERS = {
     ),
     "Accept": "application/json",
     "Referer": "https://accenture.wd103.myworkdayjobs.com/AccentureCareers",
+}
+
+
+# ─────────────────────────────────────────────
+#  Experience Level Filter
+# ─────────────────────────────────────────────
+#
+#  Accenture doesn't expose "years of experience" in the API response,
+#  so we infer seniority from the job TITLE using keyword matching.
+#
+#  JUNIOR  (0–2 yrs) : Analyst, Associate, Junior, Entry, Graduate, Fresher, Trainee
+#  MID     (1–4 yrs) : Senior Analyst, Consultant, Developer (no prefix)
+#  SENIOR  (4+ yrs)  : Senior, Lead, Manager, Architect, Principal, Staff
+#
+#  With 1 year experience → JUNIOR + MID titles are shown, SENIOR is skipped.
+#  You can tweak EXPERIENCE_RULES below to your liking.
+
+EXPERIENCE_RULES = {
+    # Keywords in title → treat as this level
+    "junior": [
+        "analyst", "associate", "junior", "entry", "graduate",
+        "fresher", "trainee", "apprentice", "new grad", "campus"
+    ],
+    "mid": [
+        "consultant", "developer", "engineer", "programmer",
+        "specialist", "technologist", "member of technical staff"
+    ],
+    "senior": [
+        "senior", "sr.", "lead", "manager", "architect",
+        "principal", "staff", "director", "vp", "head of",
+        "chief", "president"
+    ],
+}
+
+# Which levels to ALLOW based on your experience years
+# 0–1 yr  → junior only
+# 1–3 yrs → junior + mid  ← Pranav's range
+# 3+ yrs  → mid + senior
+def get_allowed_levels(experience_years: int) -> list[str]:
+    if experience_years <= 0:
+        return ["junior"]
+    elif experience_years <= 3:
+        return ["junior", "mid"]
+    else:
+        return ["junior", "mid", "senior"]
+
+
+def get_job_level(title: str) -> str:
+    """Infer seniority level from job title. Returns 'junior', 'mid', or 'senior'."""
+    title_lower = title.lower()
+    # Check senior first (most specific), then junior, then default to mid
+    for keyword in EXPERIENCE_RULES["senior"]:
+        if keyword in title_lower:
+            return "senior"
+    for keyword in EXPERIENCE_RULES["junior"]:
+        if keyword in title_lower:
+            return "junior"
+    return "mid"  # default — plain "Developer", "Engineer" etc.
+
+
+def is_relevant_for_experience(title: str, cfg: dict) -> bool:
+    """Return True if this job title matches the user's experience level."""
+    if not cfg.get("filter_by_experience", True):
+        return True  # filtering disabled, allow everything
+    allowed = get_allowed_levels(cfg["my_experience_years"])
+    level = get_job_level(title)
+    return level in allowed
+
+
+LEVEL_EMOJI = {
+    "junior": "🟢",   # entry level — great fit
+    "mid":    "🟡",   # mid level — good fit
+    "senior": "🔴",   # senior — filtered out by default
 }
 
 
@@ -95,10 +177,13 @@ def send_telegram(message: str, cfg: dict):
 
 def test_telegram(cfg: dict):
     """Send a test message to verify setup."""
+    allowed = get_allowed_levels(cfg["my_experience_years"])
+    levels_str = " + ".join(allowed)
     msg = (
         "✅ <b>Accenture Job Alert is active!</b>\n\n"
         f"🔍 Watching for: <b>{cfg['search_keyword'] or 'all roles'}</b>\n"
         f"📍 Location: <b>{cfg['location']}</b>\n"
+        f"🎯 Experience filter: <b>{cfg['my_experience_years']} yr → {levels_str} roles</b>\n"
         f"⏱ Checking every <b>{cfg['check_interval_minutes']} min</b>\n\n"
         "You'll be notified here the moment new jobs are posted. 🚀"
     )
@@ -175,24 +260,39 @@ def run_check(cfg: dict) -> int:
             seen.add(unique_key)
 
     if new_jobs:
-        print(f"  → 🎉 {len(new_jobs)} NEW job(s) found! Sending Telegram alert...")
+        print(f"  → 🎉 {len(new_jobs)} NEW job(s) found! Applying experience filter...")
 
+        filtered_jobs = []
         for job in new_jobs:
-            title    = job.get("title", "N/A")
-            location = job.get("locationsText", "India")
-            posted   = job.get("postedOn", "")
-            url      = build_job_url(job)
+            title = job.get("title", "")
+            level = get_job_level(title)
+            relevant = is_relevant_for_experience(title, cfg)
+            status = "✓ MATCH" if relevant else "✗ SKIP (too senior)"
+            print(f"     [{status}] {title}  [{level}]")
+            if relevant:
+                filtered_jobs.append((job, level))
 
-            msg = (
-                f"🔔 <b>New Accenture Job!</b>\n\n"
-                f"💼 <b>{title}</b>\n"
-                f"📍 {location}\n"
-                + (f"🗓 {posted}\n" if posted else "")
-                + f"\n<a href='{url}'>👉 Apply Now</a>"
-            )
-            send_telegram(msg, cfg)
-            print(f"     • {title} — {location}")
-            time.sleep(0.5)  # avoid Telegram rate limit on burst
+        if filtered_jobs:
+            print(f"  → Sending {len(filtered_jobs)} relevant job(s) to Telegram...")
+            for job, level in filtered_jobs:
+                title    = job.get("title", "N/A")
+                location = job.get("locationsText", "India")
+                posted   = job.get("postedOn", "")
+                url      = build_job_url(job)
+                emoji    = LEVEL_EMOJI.get(level, "🔵")
+
+                msg = (
+                    f"🔔 <b>New Accenture Job!</b>  {emoji}\n\n"
+                    f"💼 <b>{title}</b>\n"
+                    f"📍 {location}\n"
+                    f"🎯 Level: <b>{level.capitalize()}</b>\n"
+                    + (f"🗓 {posted}\n" if posted else "")
+                    + f"\n<a href='{url}'>👉 Apply Now</a>"
+                )
+                send_telegram(msg, cfg)
+                time.sleep(0.5)
+        else:
+            print("  → All new jobs were filtered out (too senior for your experience).")
     else:
         print("  → No new jobs since last check.")
 
@@ -228,9 +328,11 @@ def main():
 
     if args.watch:
         print("\n▶ Watch mode ON. Press Ctrl+C to stop.\n")
+        allowed = get_allowed_levels(CONFIG["my_experience_years"])
         send_telegram(
             f"▶️ <b>Job Alert started!</b>\n"
             f"Watching Accenture India for <b>{CONFIG['search_keyword'] or 'all roles'}</b>\n"
+            f"🎯 Experience: <b>{CONFIG['my_experience_years']} yr → {' + '.join(allowed)} roles</b>\n"
             f"Checking every {CONFIG['check_interval_minutes']} min ⏱",
             CONFIG
         )
